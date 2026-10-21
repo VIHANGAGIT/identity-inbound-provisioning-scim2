@@ -31,6 +31,8 @@ import org.wso2.carbon.identity.application.common.model.IdPGroup;
 import org.wso2.carbon.identity.application.common.model.ServiceProvider;
 import org.wso2.carbon.identity.application.mgt.ApplicationConstants;
 import org.wso2.carbon.identity.application.mgt.ApplicationManagementService;
+import org.wso2.carbon.identity.application.mgt.ApplicationMgtUtil;
+import org.wso2.carbon.identity.core.util.IdentityTenantUtil;
 import org.wso2.carbon.identity.core.util.IdentityUtil;
 import org.wso2.carbon.identity.organization.management.service.exception.OrganizationManagementException;
 import org.wso2.carbon.identity.organization.management.service.util.OrganizationManagementUtil;
@@ -167,9 +169,15 @@ public class SCIMRoleManagerV2 implements RoleV2Manager {
             List<String> localGroupIds = groupIds.stream()
                     .filter(groupId -> !validIdpGroupIds.contains(groupId))
                     .collect(Collectors.toList());
-            RoleBasicInfo roleBasicInfo =
-                    roleManagementService.addRole(role.getDisplayName(), role.getUsers(), localGroupIds,
-                            permissionList, audienceType, role.getAudienceValue(), tenantDomain);
+            RoleBasicInfo roleBasicInfo;
+            // Mark the role as created by the organization, so that it is handled as an organization custom role.
+            IdentityUtil.threadLocalProperties.get().put(RoleConstants.IS_ORGANIZATION_CUSTOM_ROLE_CREATION_FLOW, true);
+            try {
+                roleBasicInfo = roleManagementService.addRole(role.getDisplayName(), role.getUsers(), localGroupIds,
+                        permissionList, audienceType, role.getAudienceValue(), tenantDomain);
+            } finally {
+                IdentityUtil.threadLocalProperties.get().remove(RoleConstants.IS_ORGANIZATION_CUSTOM_ROLE_CREATION_FLOW);
+            }
             if (isNotEmpty(idpGroupList)) {
                 roleManagementService.updateIdpGroupListOfRole(roleBasicInfo.getId(), idpGroupList, new ArrayList<>(),
                         tenantDomain);
@@ -533,10 +541,15 @@ public class SCIMRoleManagerV2 implements RoleV2Manager {
             }
 
             // If users and groups are provided, they will be ignored. No error response will be returned.
-            RoleBasicInfo roleBasicInfo =
-                    roleManagementService.addRole(role.getDisplayName(), Collections.emptyList(),
-                            Collections.emptyList(), permissionList, audienceType,
-                            role.getAudienceValue(), tenantDomain);
+            RoleBasicInfo roleBasicInfo;
+            // Mark the role as created by the organization, so that it is handled as an organization custom role.
+            IdentityUtil.threadLocalProperties.get().put(RoleConstants.IS_ORGANIZATION_CUSTOM_ROLE_CREATION_FLOW, true);
+            try {
+                roleBasicInfo = roleManagementService.addRole(role.getDisplayName(), Collections.emptyList(),
+                        Collections.emptyList(), permissionList, audienceType, role.getAudienceValue(), tenantDomain);
+            } finally {
+                IdentityUtil.threadLocalProperties.get().remove(RoleConstants.IS_ORGANIZATION_CUSTOM_ROLE_CREATION_FLOW);
+            }
 
             String locationURI = getSCIMRoleURLBasedOnVersion(roleBasicInfo.getId());
             return buildSCIMRoleResponse(roleBasicInfo, locationURI);
@@ -1871,11 +1884,34 @@ public class SCIMRoleManagerV2 implements RoleV2Manager {
 
             if (app.getSpProperties() != null && Arrays.stream(app.getSpProperties())
                     .anyMatch(property -> ApplicationConstants.IS_FRAGMENT_APP.equals(property.getName())
-                            && Boolean.parseBoolean(property.getValue()))) {
+                            && Boolean.parseBoolean(property.getValue()))
+                    && !isOrganizationCustomRolesEnabled(audienceValue)) {
                 throw new BadRequestException("Role creation for shared applications is not allowed at " +
                         "organization level.");
             }
         }
+    }
+
+    /**
+     * Check whether the main application of the given shared application allows organizations to create application
+     * roles for its shared applications.
+     *
+     * @param sharedAppId ID of the shared application.
+     * @return True if application role creation is enabled for the shared application.
+     * @throws IdentityApplicationManagementException IdentityApplicationManagementException.
+     */
+    private boolean isOrganizationCustomRolesEnabled(String sharedAppId) throws IdentityApplicationManagementException {
+
+        ApplicationManagementService applicationManagementService = ApplicationManagementService.getInstance();
+        String mainAppId = applicationManagementService.getMainAppId(sharedAppId);
+        if (StringUtils.isBlank(mainAppId)) {
+            return false;
+        }
+        String mainAppTenantDomain =
+                IdentityTenantUtil.getTenantDomain(applicationManagementService.getTenantIdByApp(mainAppId));
+        return ApplicationMgtUtil.isOrganizationCustomRolesEnabled(
+                applicationManagementService.getApplicationByResourceId(mainAppId, mainAppTenantDomain),
+                RoleConstants.APPLICATION);
     }
 
     private List<Permission> buildPermissionList(List<String> permissionValues) {

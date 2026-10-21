@@ -30,12 +30,15 @@ import org.testng.annotations.Test;
 import org.wso2.carbon.base.CarbonBaseConstants;
 import org.wso2.carbon.context.OperationScopeValidationContext;
 import org.wso2.carbon.context.PrivilegedCarbonContext;
+import org.wso2.carbon.identity.application.common.model.AssociatedRolesConfig;
 import org.wso2.carbon.identity.application.common.model.ServiceProviderProperty;
 import org.wso2.carbon.identity.application.mgt.ApplicationConstants;
 import org.wso2.carbon.identity.application.mgt.ApplicationManagementService;
+import org.wso2.carbon.identity.core.util.IdentityTenantUtil;
 import org.wso2.carbon.identity.core.util.IdentityUtil;
 import org.wso2.carbon.identity.organization.management.service.exception.OrganizationManagementException;
 import org.wso2.carbon.identity.organization.management.service.util.OrganizationManagementUtil;
+import org.wso2.carbon.identity.role.v2.mgt.core.RoleConstants;
 import org.wso2.carbon.identity.role.v2.mgt.core.RoleManagementService;
 import org.wso2.carbon.identity.role.v2.mgt.core.exception.IdentityRoleManagementException;
 import org.wso2.carbon.identity.role.v2.mgt.core.model.Permission;
@@ -86,6 +89,7 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import static org.mockito.MockitoAnnotations.openMocks;
 import static org.testng.Assert.assertEquals;
+import static org.testng.Assert.assertFalse;
 import static org.testng.Assert.assertTrue;
 import static org.testng.Assert.fail;
 import static org.wso2.carbon.identity.role.v2.mgt.core.RoleConstants.Error.INVALID_AUDIENCE;
@@ -815,5 +819,58 @@ public class SCIMRoleManagerV2Test {
         RoleV2 roleV2 = new RoleV2();
         roleV2.setAudience("APPLICATION", "ApplicationName", "APPLICATION");
         scimRoleManagerV2.createRole(roleV2);
+    }
+
+    @Test(expectedExceptions = ConflictException.class)
+    public void testCreateRoleForSharedApplicationWhenAllowed() throws Exception {
+
+        when(OrganizationManagementUtil.isOrganization(SAMPLE_TENANT_DOMAIN)).thenReturn(true);
+        when(SCIMCommonComponentHolder.getIdpManagerService()).thenReturn(idpManager);
+        // Organization custom roles feature is enabled for the server.
+        identityUtil.when(() -> IdentityUtil.getProperty("OrganizationCustomRolesFeatureEnabled")).thenReturn("true");
+        // Shared (fragment) application in the organization.
+        ServiceProvider app = new ServiceProvider();
+        ServiceProviderProperty isFragmentAppProperty = new ServiceProviderProperty();
+        isFragmentAppProperty.setName(ApplicationConstants.IS_FRAGMENT_APP);
+        isFragmentAppProperty.setValue("true");
+        app.setSpProperties(new ServiceProviderProperty[]{isFragmentAppProperty});
+        // Main application which allows organizations to create application roles.
+        ServiceProvider mainApp = new ServiceProvider();
+        mainApp.setEnhancedOrganizationAuthenticationEnabled(true);
+        mainApp.setOrganizationCustomRolesEnabled(true);
+        AssociatedRolesConfig associatedRolesConfig = new AssociatedRolesConfig();
+        associatedRolesConfig.setAllowedAudience("application");
+        mainApp.setAssociatedRolesConfig(associatedRolesConfig);
+
+        when(ApplicationManagementService.getInstance()).thenReturn(applicationManagementService);
+        when(applicationManagementService.getApplicationByResourceId(anyString(), eq(SAMPLE_TENANT_DOMAIN)))
+                .thenReturn(app);
+        when(applicationManagementService.getMainAppId(anyString())).thenReturn("MainAppId");
+        when(applicationManagementService.getTenantIdByApp("MainAppId")).thenReturn(-1234);
+        when(applicationManagementService.getApplicationByResourceId(eq("MainAppId"), any()))
+                .thenReturn(mainApp);
+        // Reaching role management shows that the shared application is not rejected.
+        boolean[] isOrganizationCustomRoleCreationFlow = {false};
+        when(roleManagementService.addRole(eq(ROLE_NAME), any(), any(), any(), any(), any(), eq(SAMPLE_TENANT_DOMAIN)))
+                .thenAnswer(invocation -> {
+                    isOrganizationCustomRoleCreationFlow[0] = Boolean.TRUE.equals(IdentityUtil.threadLocalProperties
+                            .get().get(RoleConstants.IS_ORGANIZATION_CUSTOM_ROLE_CREATION_FLOW));
+                    throw new IdentityRoleManagementException(ROLE_ALREADY_EXISTS.getCode(), "Role already exists.");
+                });
+
+        RoleV2 roleV2 = new RoleV2();
+        roleV2.setDisplayName(ROLE_NAME);
+        roleV2.setAudience("APPLICATION", "SharedAppId", "APPLICATION");
+        try (MockedStatic<IdentityTenantUtil> identityTenantUtil = mockStatic(IdentityTenantUtil.class)) {
+            identityTenantUtil.when(() -> IdentityTenantUtil.getTenantDomain(-1234)).thenReturn("carbon.super");
+            scimRoleManagerV2.createRole(roleV2);
+        } finally {
+            // The application management service mock is shared by the other tests.
+            when(applicationManagementService.getMainAppId(anyString())).thenReturn(null);
+            // The role is marked as created by the organization only while it is being added.
+            assertTrue(isOrganizationCustomRoleCreationFlow[0]);
+            assertFalse(IdentityUtil.threadLocalProperties.get()
+                    .containsKey(RoleConstants.IS_ORGANIZATION_CUSTOM_ROLE_CREATION_FLOW));
+        }
     }
 }
